@@ -1,7 +1,7 @@
 import express from 'express'
 import { db } from './db.js'
 import {
-  now, statsSummary, validateItem, ingestPost, addTimeline
+  now, statsSummary, validateItem, ingestPost, addTimeline, bindPipelineProp
 } from './pipeline.js'
 import {
   JOB_MAX, createJob, getJob, listJobs, resumeJob, pauseJob, recoverInterrupted
@@ -24,7 +24,13 @@ import {
   blockWorkOrder, completeWorkOrder, reworkWorkOrder, cancelWorkOrder,
   startWorkOrderScheduler, bindWorkOrderNotify
 } from './workorders.js'
-import { generateForWorkOrder } from './notify.js'
+import { generateForWorkOrder, generateForPropagation } from './notify.js'
+import {
+  PROP_STAGE, NODE_TYPES, EDGE_TYPES,
+  listGraphs, getGraph, propSummary, createGraph, addNode, addEdge,
+  setStage, bindCrisis, dispatchWorkOrders, deleteGraph,
+  ensureGraphForAlertEvent, bindPropNotify
+} from './prop.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -50,13 +56,18 @@ bindWorkOrderNotify({
   escalateWorkOrderTasks: (id, level) => generateForWorkOrder(id, level)
 })
 startWorkOrderScheduler()
+// 传播路径：注入通知联动钩子（阶段变化/关键节点/传播激增 → 通知任务）
+bindPropNotify({ notify: (gid, ev, opts) => generateForPropagation(gid, ev, opts) })
+// 预警 → 传播路径联动：预警触发自动建档（红/橙）/并入既有路径（任意级别）
+bindPipelineProp({ ensureGraphForAlertEvent })
 
 // 危机列表（含来源规则、承接规则、未解除预警数、协同工单统计、时间线）
 function crisisList(withTimeline = false) {
   const list = q(`SELECT c.*, a.title alert_title,
     (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events,
     (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id AND wo.status IN ('todo','doing','blocked')) wo_open,
-    (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id) wo_total
+    (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id) wo_total,
+    (SELECT COUNT(*) FROM propagation_graphs pg WHERE pg.crisis_id=c.id) prop_total
     FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
   return list.map((c) => {
     const rules = q(`SELECT ca.alert_id, ca.is_origin, ca.first_at, ca.last_at, al.title alert_title, al.level alert_level
@@ -84,7 +95,10 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen,
     (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning,
     (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing','blocked')) workOpen,
-    (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing') AND due_at IS NOT NULL AND due_at<?) workOverdue`, Date.now())
+    (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing') AND due_at IS NOT NULL AND due_at<?) workOverdue,
+    (SELECT COUNT(*) FROM propagation_graphs WHERE stage IN ('seed','spread','outbreak')) propWatch,
+    (SELECT COUNT(*) FROM propagation_graphs WHERE stage='outbreak') propOutbreak,
+    (SELECT COUNT(*) FROM propagation_graphs) propTotal`, Date.now())
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -487,6 +501,8 @@ app.delete('/api/crisis/:id', (req, res) => {
   const woIds = q('SELECT id FROM work_orders WHERE crisis_id=?', req.params.id).map((r) => r.id)
   for (const wid of woIds) run('DELETE FROM work_order_logs WHERE wo_id=?', wid)
   run('DELETE FROM work_orders WHERE crisis_id=?', req.params.id)
+  // 传播路径不删除，仅解绑危机关联（节点/转发沉淀保留，可重新关联）
+  run('UPDATE propagation_graphs SET crisis_id=NULL, updated=? WHERE crisis_id=?', now(), req.params.id)
   run('DELETE FROM crisis WHERE id=?', req.params.id)
   res.json({ ok: true })
 })
@@ -604,13 +620,13 @@ app.post('/api/notify/subs', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,active,created,created_by)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+  run(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,wo_event,prop_event,active,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), now(), req.actor.user)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), now(), req.actor.user)
   res.json({ ok: true })
 })
 app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
@@ -619,12 +635,12 @@ app.put('/api/notify/subs/:id', guard('admin'), (req, res) => {
   const err = validateSub(req.body)
   if (err) return res.status(400).json({ error: err })
   const b = req.body
-  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=? WHERE id=?`,
+  run(`UPDATE notify_subs SET name=?,alert_id=?,topic=?,crisis_status=?,levels=?,channel_ids=?,require_ack=?,ack_timeout_min=?,escalate_channel_id=?,max_retry=?,wo_event=?,prop_event=? WHERE id=?`,
     b.name.trim(), b.alert_id ? +b.alert_id : null, (b.topic || '').trim(), String(b.crisis_status || ''),
     (Array.isArray(b.levels) ? b.levels : []).filter((x) => ['red', 'orange', 'yellow'].includes(x)).join(','),
     JSON.stringify(b.channel_ids.map(Number)), b.require_ack ? 1 : 0,
     Math.max(1, +b.ack_timeout_min || 30), b.escalate_channel_id ? +b.escalate_channel_id : null,
-    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), s.id)
+    Math.min(5, Math.max(1, +b.max_retry || 3)), String(b.wo_event || ''), String(b.prop_event || ''), s.id)
   res.json({ ok: true })
 })
 app.post('/api/notify/subs/:id/toggle', guard('admin'), (req, res) => {
@@ -758,6 +774,67 @@ app.get('/api/collect/runs', (req, res) => {
       limit: Math.min(200, +req.query.limit || 50)
     })
   })
+})
+
+// ===== 舆情传播路径分析：来源/节点/转发关系/影响阶段沉淀，关联预警与危机，
+//       阶段变化等触发通知（订阅复用通知中心），并可一键生成跨角色处置工单 =====
+// 权限：viewer 只读 / ops 节点/转发/阶段/关联/工单 / admin 同 ops 且可建档/删除
+app.get('/api/propagation', (req, res) => {
+  const items = listGraphs({
+    stage: String(req.query.stage || ''),
+    crisisId: String(req.query.crisis_id || ''),
+    topic: String(req.query.topic || ''),
+    limit: +req.query.limit || 100
+  })
+  res.json({
+    items, summary: propSummary(),
+    dict: { stage: PROP_STAGE, nodeType: NODE_TYPES, edgeType: EDGE_TYPES },
+    actor: actorOf(req)
+  })
+})
+app.get('/api/propagation/:id', (req, res) => {
+  const g = getGraph(+req.params.id)
+  if (!g) return res.status(404).json({ error: '传播路径不存在' })
+  res.json(g)
+})
+app.post('/api/propagation', guard('admin'), (req, res) => {
+  const r = createGraph(req.body, req.actor)
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.post('/api/propagation/:id/nodes', guard('ops'), (req, res) => {
+  const r = addNode(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '传播路径不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.post('/api/propagation/:id/edges', guard('ops'), (req, res) => {
+  const r = addEdge(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '传播路径不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.post('/api/propagation/:id/stage', guard('ops'), (req, res) => {
+  const r = setStage(+req.params.id, req.body, req.actor)
+  if (!r) return res.status(404).json({ error: '传播路径不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.post('/api/propagation/:id/bind-crisis', guard('ops'), (req, res) => {
+  const r = bindCrisis(+req.params.id, req.body?.crisis_id ?? null, req.body || {}, req.actor)
+  if (!r) return res.status(404).json({ error: '传播路径不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.post('/api/propagation/:id/dispatch-workorders', guard('ops'), (req, res) => {
+  const r = dispatchWorkOrders(+req.params.id, req.body || {}, req.actor)
+  if (!r) return res.status(404).json({ error: '传播路径不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json(r)
+})
+app.delete('/api/propagation/:id', guard('admin'), (req, res) => {
+  if (!deleteGraph(+req.params.id)) return res.status(404).json({ error: '传播路径不存在' })
+  res.json({ ok: true })
 })
 
 const PORT = Number(process.env.PORT) || 4130

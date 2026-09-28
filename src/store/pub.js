@@ -20,6 +20,7 @@ export const usePubStore = defineStore('pub', {
     user: { name: '张岚', role: 'admin' }, // 当前身份（admin 管理员 / ops 值班员 / viewer 观察员）
     tab: 'dash',          // 当前页签（危机卡片可跳转协同工单）
     woDraftCrisis: null,  // 从危机卡片「拆分工单」带入的预填危机 id
+    propDraftCrisis: null, // 从危机卡片「传播路径」带入的预填危机 id
     toast: null
   }),
   actions: {
@@ -149,6 +150,31 @@ export const usePubStore = defineStore('pub', {
     async workOrderOp(id, op, body) {
       const r = await api(`/work-orders/${id}/${op}`, 'POST', body || {})
       await this.load() // 工单回写危机时间线/预警状态：刷新全局统计
+      return r
+    },
+    // ===== 舆情传播路径分析 =====
+    async fetchPropagation(filter) { return await api('/propagation', 'GET', null, filter) },
+    async fetchPropGraph(id) { return await api(`/propagation/${id}`) },
+    async createPropGraph(g) {
+      const r = await api('/propagation', 'POST', g)
+      await this.load()
+      this.msg(`传播路径 #${r.id} 已建档`, 'success')
+      return r
+    },
+    async propOp(id, op, body) {
+      const r = await api(`/propagation/${id}/${op}`, 'POST', body || {})
+      await this.load() // 阶段/关联变化刷新全局角标
+      return r
+    },
+    async delPropGraph(id) {
+      await api(`/propagation/${id}`, 'DELETE')
+      await this.load()
+      this.msg('传播路径已删除（节点与转发沉淀一并清除）', 'success')
+    },
+    async propDispatch(id, body) {
+      const r = await api(`/propagation/${id}/dispatch-workorders`, 'POST', body)
+      await this.load()
+      this.msg(`已按当前影响阶段生成 ${r.ids.length} 张跨角色处置工单`, 'success')
       return r
     }
   }

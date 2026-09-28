@@ -44,8 +44,8 @@ function addLog(taskId, action, detail, operator = '系统') {
 }
 
 // ===== 任务生成（订阅匹配 → 多渠道并行任务；幂等键去重，重复触发不产生重复任务） =====
-// opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）
-function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', idemTag = '', title, content }) {
+// opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）/ propagation（传播事件）
+function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', propGraphId = null, propEvent = '', idemTag = '', title, content }) {
   const created = []
   const ts = now()
   for (const chId of subChannels(sub)) {
@@ -53,12 +53,15 @@ function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKe
     if (!ch || !ch.enabled) continue // 停用/已删除渠道跳过
     const src = kind === 'alert' ? `alert:${alertEventId}`
       : kind === 'workorder' ? `wo:${woId}:${idemTag || woEvent}`
+      : kind === 'propagation' ? `prop:${propGraphId}:${idemTag || propEvent}`
       : `crisis:${crisisId}:${statusKey}`
     const r = run(`INSERT OR IGNORE INTO notify_tasks
-      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,work_order_id,wo_event,created,updated)
-      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,NULL,?,?,?,?,?)`,
-      `${src}:sub${sub.id}:ch${chId}`, sub.id, chId, alertEventId, crisisId, kind === 'workorder' ? 'workorder' : kind, title, content,
-      Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0, woId, woEvent, ts, ts)
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,work_order_id,wo_event,propagation_graph_id,prop_event,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,NULL,?,?,?,?,?,?,?)`,
+      `${src}:sub${sub.id}:ch${chId}`, sub.id, chId, alertEventId, crisisId,
+      kind === 'workorder' ? 'workorder' : kind === 'propagation' ? 'propagation' : kind, title, content,
+      Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0,
+      woId, woEvent, propGraphId, propEvent, ts, ts)
     if (Number(r.changes)) {
       const id = Number(r.lastInsertRowid)
       addLog(id, 'created', `订阅「${sub.name}」匹配，生成通知任务（渠道：${ch.name}）`)
@@ -142,6 +145,25 @@ export function generateForWorkOrder(woId, woEvent, opts = {}) {
 // 工单超时升级通知：升级类任务写危机时间线（与回执超时升级一致），由工单调度器驱动
 export function notifyWorkOrderEscalation(woId, level) {
   return generateForWorkOrder(woId, level)
+}
+
+// ===== 传播事件 → 通知任务（prop_event：stage 影响阶段变化 / keynode 关键节点 / surge 传播激增） =====
+// 按「传播路径 × 事件 × 订阅 × 渠道」幂等生成；可按话题限定；阶段变化等事件复用重试/回执/升级调度。
+export const PROP_EVENTS = { stage: '影响阶段变化', keynode: '关键节点出现', surge: '传播激增' }
+export function generateForPropagation(graphId, propEvent, { title, content, idemTag = '' } = {}) {
+  const g = q1('SELECT * FROM propagation_graphs WHERE id=?', graphId)
+  if (!g || !PROP_EVENTS[propEvent]) return []
+  const all = []
+  for (const s of q('SELECT * FROM notify_subs WHERE active=1 AND prop_event=?', propEvent)) {
+    if (s.crisis_status || s.wo_event) continue
+    if (s.topic && s.topic !== (g.topic || '')) continue
+    all.push(...createTasks(s, {
+      kind: 'propagation', propGraphId: graphId, propEvent, idemTag,
+      crisisId: g.crisis_id, title: title || `【传播${PROP_EVENTS[propEvent]}】${g.title}`,
+      content: content || `传播路径 #${graphId}「${g.title}」发生${PROP_EVENTS[propEvent]}事件`
+    }))
+  }
+  return all
 }
 
 // ===== 模拟发送（演示）：渠道地址含 always-fail 持续失败、含 flaky 首次失败（验证自动重试） =====
@@ -362,7 +384,9 @@ export function validateSub(b) {
   if (cs && !CRISIS_STATUS_TEXT[cs]) return '危机状态无效'
   const we = String(b.wo_event || '')
   if (we && !['created', 'escalated'].includes(we)) return '工单事件无效（created/escalated）'
-  if (we && cs) return '工单事件订阅不能再选危机状态'
+  const pe = String(b.prop_event || '')
+  if (pe && !['stage', 'keynode', 'surge'].includes(pe)) return '传播事件无效（stage/keynode/surge）'
+  if ([cs, we, pe].filter(Boolean).length > 1) return '危机状态 / 工单事件 / 传播事件三类订阅互斥，只能选一种'
   const chs = Array.isArray(b.channel_ids) ? b.channel_ids.map(Number).filter(Number.isInteger) : []
   if (!chs.length) return '至少选择一个通知渠道'
   for (const id of chs) if (!q1('SELECT 1 FROM notify_channels WHERE id=?', id)) return `渠道 #${id} 不存在`

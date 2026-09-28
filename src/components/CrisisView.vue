@@ -30,6 +30,7 @@
           <span class="origin" :class="c.origin">{{ c.origin==='auto' ? '🤖 自动建档' : '✍️ 人工建档' }}</span>
           <span v-if="c.open_events" class="open-badge">🔔 未解除预警 {{ c.open_events }}</span>
           <span v-if="c.wo_total" class="wo-badge" :class="{open:c.wo_open}">📋 工单 {{ c.wo_open ? c.wo_open+' 在办 / ' : '' }}{{ c.wo_total }}</span>
+          <span v-if="c.prop_total" class="prop-badge">🕸️ 传播路径 {{ c.prop_total }}</span>
           <span class="st" :class="c.status">{{ stText(c.status) }}</span>
           <button class="del" @click="del(c)">✕</button>
         </div>
@@ -124,6 +125,7 @@
           <button class="ghost" @click="addStep(c)">＋ 记录处置</button>
           <button v-if="c.status==='monitoring'||c.status==='disposal'" class="prog" @click="advance(c)">推进处置</button>
           <button v-if="c.status!=='closed'" class="wo-btn" @click="splitWorkOrder(c)">📋 拆分工单</button>
+          <button class="prop-btn" @click="openProp(c)">🕸️ 传播路径</button>
           <button class="ghost" @click="toggleReview(c)">{{ reviewId===c.id ? '收起回溯' : '🔍 回溯' }}</button>
           <button v-if="c.status!=='closed'" class="close" @click="toggleReview(c, true)">结案</button>
           <button v-else class="reopen" @click="reopen(c)">↩︎ 回滚结案</button>
@@ -180,6 +182,11 @@ function splitWorkOrder(c) {
   store.woDraftCrisis = c.id
   store.tab = 'work'
 }
+// 跳转传播路径页：已有关联路径直接查看，未建档则预填话题/危机引导建档
+function openProp(c) {
+  store.propHraftCrisis = c.prop_total ? null : c.id
+  store.tab = 'prop'
+}
 async function reopen(c) {
   const note = prompt(`回滚结案「${c.title}」：结案时联动解除的预警将恢复为未解除，事件重回处置流程。\n回滚说明（可留空）：`)
   if (note == null) return
@@ -218,6 +225,7 @@ textarea{resize:vertical;min-height:52px;}
 .open-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.3);}
 .wo-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .wo-badge.open{background:#132a52;color:#bbdefb;border-color:rgba(66,165,245,.4);}
+.prop-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#1e1430;color:#ce93d8;border:1px solid rgba(126,87,194,.4);}
 .st{font-size:11px;padding:2px 10px;border-radius:6px;}
 .st.monitoring{background:#37474f;color:#b0bec5;}.st.disposal{background:#b71c1c;color:#ffcdd2;}.st.closed{background:#1b5e20;color:#a5d6a7;}
 .del{background:none;border:none;color:#ef5350;font-size:15px;cursor:pointer;}
@@ -282,6 +290,7 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .prog{background:linear-gradient(135deg,#ef6c00,#e65100);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .wo-btn{background:linear-gradient(135deg,#00897b,#00695c);border:none;color:#fff;font-weight:600;cursor:pointer;}
+.prop-btn{background:linear-gradient(135deg,#7b1fa2,#4527a0);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .close{background:linear-gradient(135deg,#2e7d32,#1b5e20);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .reopen{background:linear-gradient(135deg,#f9a825,#f57f17);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .none{color:#5b6f94;text-align:center;padding:40px;}

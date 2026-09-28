@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS notify_subs (
   ack_timeout_min INTEGER NOT NULL DEFAULT 30, -- 回执超时（分钟），超时未确认自动升级
   escalate_channel_id INTEGER,          -- 升级渠道（空=沿用原渠道）
   max_retry INTEGER NOT NULL DEFAULT 3, -- 发送失败自动重试上限
+  wo_event TEXT NOT NULL DEFAULT '',    -- 工单事件订阅：created 拆分分派 / escalated 超时升级（空=非工单订阅）
+  prop_event TEXT NOT NULL DEFAULT '',  -- 传播事件订阅：stage 阶段变化 / keynode 关键节点 / surge 传播激增（空=非传播订阅）
   active INTEGER NOT NULL DEFAULT 1,
   created TEXT NOT NULL,
   created_by TEXT NOT NULL DEFAULT ''
@@ -135,7 +137,7 @@ CREATE TABLE IF NOT EXISTS notify_tasks (
   channel_id INTEGER NOT NULL,
   alert_event_id INTEGER,               -- 来源预警触发（回执同步解除用）
   crisis_id INTEGER,                    -- 来源危机事件（回执/升级写时间线）
-  kind TEXT NOT NULL DEFAULT 'alert',   -- alert/crisis
+  kind TEXT NOT NULL DEFAULT 'alert',   -- alert/crisis/workorder/propagation
   title TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending', -- pending/sent/failed/acked/escalated/paused/cancelled
@@ -264,6 +266,7 @@ CREATE TABLE IF NOT EXISTS work_orders (
   blocked_reason TEXT NOT NULL DEFAULT '',
   result TEXT NOT NULL DEFAULT '',        -- 处理结果（完成时回写危机时间线）
   resolve_alerts INTEGER NOT NULL DEFAULT 0, -- 完成时是否联动解除该危机下未解除预警
+  prop_graph_id INTEGER,                  -- 来源传播路径（传播分析一键生成的跨角色工单）
   sla_budget_ms INTEGER,                  -- SLA 总时长（毫秒），阻塞恢复后据此重算截止
   paused_at INTEGER,                      -- 阻塞挂起时刻（毫秒），NULL=计时中
   started_at TEXT,
@@ -285,6 +288,64 @@ CREATE TABLE IF NOT EXISTS work_order_logs (
   time TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_order_logs_wo ON work_order_logs (wo_id, id);
+-- 舆情传播路径：沉淀来源（首爆帖/渠道/媒体）、影响阶段（萌芽→扩散→爆发→衰退→平息），关联预警与危机事件
+CREATE TABLE IF NOT EXISTS propagation_graphs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  topic TEXT NOT NULL DEFAULT '',       -- 话题键（与危机/预警同口径归并）
+  post_id INTEGER,                      -- 首爆来源舆情
+  alert_event_id INTEGER,               -- 来源预警触发（红/橙预警自动建档传播路径）
+  crisis_id INTEGER,                    -- 关联危机事件（可自动/手动绑定/改绑）
+  stage TEXT NOT NULL DEFAULT 'seed',   -- seed/spread/outbreak/recession/calm
+  heat INTEGER NOT NULL DEFAULT 0,      -- 事件热度（0-100，节点变化时取 max 重算）
+  total_reach INTEGER NOT NULL DEFAULT 0, -- 累计触达（节点触达+转发扩散汇总）
+  node_count INTEGER NOT NULL DEFAULT 0,
+  edge_count INTEGER NOT NULL DEFAULT 0,
+  origin_text TEXT NOT NULL DEFAULT '', -- 来源沉淀：首爆账号/链接/媒体描述
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_graphs_topic ON propagation_graphs (topic, id);
+CREATE INDEX IF NOT EXISTS idx_prop_graphs_crisis ON propagation_graphs (crisis_id);
+-- 传播节点：来源帖/转发账号（KOL/媒体/官方/普通），带触达量与深度（距来源层级）
+CREATE TABLE IF NOT EXISTS propagation_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  graph_id INTEGER NOT NULL,
+  post_id INTEGER,                      -- 可关联具体舆情（来源帖/转述帖）
+  name TEXT NOT NULL,                   -- 账号/节点名称
+  node_type TEXT NOT NULL DEFAULT 'user', -- origin/kol/media/official/user
+  channel TEXT NOT NULL DEFAULT '',     -- 微博/微信/新闻/知乎/抖音/论坛
+  reach INTEGER NOT NULL DEFAULT 0,     -- 节点直接触达（粉丝/阅读）
+  depth INTEGER NOT NULL DEFAULT 0,     -- 传播深度（来源=0，边变化时 BFS 重算）
+  is_key INTEGER NOT NULL DEFAULT 0,    -- 关键节点（大 V/权威媒体/官方回应）
+  note TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_nodes_graph ON propagation_nodes (graph_id, depth);
+-- 转发关系：from 节点转发/引用 to 节点，带转发量与关系类型
+CREATE TABLE IF NOT EXISTS propagation_edges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  graph_id INTEGER NOT NULL,
+  from_node_id INTEGER NOT NULL,
+  to_node_id INTEGER NOT NULL,
+  edge_type TEXT NOT NULL DEFAULT 'repost', -- repost/quote/comment/report
+  reposts INTEGER NOT NULL DEFAULT 0,   -- 转发次数（扩散量按 reposts×REPOST_REACH 计入累计触达）
+  note TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_edges_graph ON propagation_edges (graph_id, id);
+CREATE INDEX IF NOT EXISTS idx_prop_edges_from ON propagation_edges (from_node_id);
+CREATE INDEX IF NOT EXISTS idx_prop_edges_to ON propagation_edges (to_node_id);
+-- 传播变更留痕：建档/节点/转发/阶段变化/关键节点/激增/关联预警危机/工单生成（含操作人，阶段变化用于触发通知）
+CREATE TABLE IF NOT EXISTS propagation_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  graph_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_logs_graph ON propagation_logs (graph_id, id);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
@@ -319,9 +380,15 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_posts_idem_key ON posts (idem_key) WHERE
 ensureColumn('notify_tasks', 'work_order_id', 'work_order_id INTEGER')
 ensureColumn('notify_tasks', 'wo_event', "wo_event TEXT NOT NULL DEFAULT ''")
 ensureColumn('notify_subs', 'wo_event', "wo_event TEXT NOT NULL DEFAULT ''")
+// 通知任务来源扩展：传播事件（阶段变化/关键节点/传播激增）复用通知调度
+ensureColumn('notify_tasks', 'propagation_graph_id', 'propagation_graph_id INTEGER')
+ensureColumn('notify_tasks', 'prop_event', "prop_event TEXT NOT NULL DEFAULT ''")
+ensureColumn('notify_subs', 'prop_event', "prop_event TEXT NOT NULL DEFAULT ''")
 // 老库迁移：工单 SLA 挂起计时字段
 ensureColumn('work_orders', 'sla_budget_ms', 'sla_budget_ms INTEGER')
 ensureColumn('work_orders', 'paused_at', 'paused_at INTEGER')
+// 工单来源扩展：传播路径一键生成的跨角色工单记录来源图
+ensureColumn('work_orders', 'prop_graph_id', 'prop_graph_id INTEGER')
 
 // 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
 // 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。
@@ -533,6 +600,13 @@ function seedNotify() {
   // 标记工单事件订阅（wo_event：created=新工单分派/认领提醒，escalated=超时升级；普通预警订阅为空）
   db.prepare("UPDATE notify_subs SET wo_event='escalated' WHERE name='工单超时升级督办' AND wo_event=''").run()
   db.prepare("UPDATE notify_subs SET wo_event='created' WHERE name='协同工单分派通知' AND wo_event=''").run()
+  // 传播路径订阅（prop_event：stage=影响阶段变化，keynode=关键节点出现，surge=传播激增）
+  ns.run('传播阶段升级预警', null, '', '', '', JSON.stringify([ch1, ch2]), 1, 1, ch4, 3, nowStr, '系统初始化')
+  db.prepare("UPDATE notify_subs SET prop_event='stage' WHERE name='传播阶段升级预警'").run()
+  ns.run('关键节点出现提醒', null, '', '', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化')
+  db.prepare("UPDATE notify_subs SET prop_event='keynode' WHERE name='关键节点出现提醒'").run()
+  ns.run('食安传播激增告警', null, '食品安全', '', '', JSON.stringify([ch1, ch4]), 0, 30, null, 3, nowStr, '系统初始化')
+  db.prepare("UPDATE notify_subs SET prop_event='surge' WHERE name='食安传播激增告警'").run()
 }
 seedNotify()
 
@@ -595,3 +669,112 @@ function seedWorkOrders() {
     .run(c1.id, '工单完成', `协同工单「关停涉事门店现场核查」已由 李澈 完成：涉事门店已关停，现场核查完成，整改清单已下发并要求 24 小时内反馈。`, ago(118))
 }
 seedWorkOrders()
+
+// 传播路径种子（独立幂等：老库升级后同样补齐演示路径；关联既有危机、舆情与预警触发）
+function seedPropagation() {
+  const n = db.prepare('SELECT COUNT(*) c FROM propagation_graphs').get().c
+  if (n > 0) return
+  const now = new Date()
+  const ago = (m) => new Date(now.getTime() - m * 60000).toLocaleString('zh-CN')
+  const REPOST_REACH = 5 // 与 server/prop.js 保持一致：每次转发的平均扩散触达
+  const c1 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%门店卫生%' ORDER BY id LIMIT 1").get()
+  const c2 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%投诉类话题%' ORDER BY id LIMIT 1").get()
+  const pFood = db.prepare("SELECT id FROM posts WHERE title LIKE '%后厨卫生%' ORDER BY id LIMIT 1").get()
+  const pShip = db.prepare("SELECT id FROM posts WHERE title LIKE '%迟迟不发货%' ORDER BY id LIMIT 1").get()
+  const pEstate = db.prepare("SELECT id FROM posts WHERE title LIKE '%延期交付%' ORDER BY id LIMIT 1").get()
+  const evFood = pFood && db.prepare('SELECT id FROM alert_events WHERE post_id=? ORDER BY id LIMIT 1').get(pFood.id)
+  const evShip = pShip && db.prepare('SELECT id FROM alert_events WHERE post_id=? ORDER BY id LIMIT 1').get(pShip.id)
+  const evEstate = pEstate && db.prepare('SELECT id FROM alert_events WHERE post_id=? ORDER BY id LIMIT 1').get(pEstate.id)
+
+  const gi = db.prepare(`INSERT INTO propagation_graphs
+    (title,topic,post_id,alert_event_id,crisis_id,stage,heat,total_reach,node_count,edge_count,origin_text,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const ni = db.prepare(`INSERT INTO propagation_nodes
+    (graph_id,post_id,name,node_type,channel,reach,depth,is_key,note,created) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+  const ei = db.prepare(`INSERT INTO propagation_edges (graph_id,from_node_id,to_node_id,edge_type,reposts,note,created) VALUES (?,?,?,?,?,?,?)`)
+  const li = db.prepare('INSERT INTO propagation_logs (graph_id,action,detail,operator,time) VALUES (?,?,?,?,?)')
+
+  // [name,type,channel,reach,depth,isKey,postId,note]
+  function buildGraph(g, nodes, edges) {
+    const id = Number(gi.run(g.title, g.topic, g.postId ?? null, g.alertEvent ?? null, g.crisisId ?? null, g.stage, g.heat,
+      g.reach, nodes.length, edges.length, g.origin, ago(g.bornAgo), ago(g.updatedAgo)).lastInsertRowid)
+    const ids = nodes.map((nd) => Number(ni.run(id, nd[7] ?? null, nd[0], nd[1], nd[2], nd[3], nd[4], nd[5] ? 1 : 0, nd[6] || '', ago(nd[8])).lastInsertRowid))
+    edges.forEach((e, i) => ei.run(id, ids[e[0]], ids[e[1]], e[2], e[3], e[4] || '', ago(g.updatedAgo + i)))
+    li.run(id, '建档', `传播路径建档：来源「${g.origin}」，话题「${g.topic}」，影响阶段：${g.stage === 'outbreak' ? '爆发' : '扩散'}`, '系统初始化', ago(g.bornAgo))
+    if (g.crisisId) li.run(id, '关联危机', `关联同话题危机事件 #${g.crisisId}（预警/危机闭环联动）`, '系统初始化', ago(g.bornAgo - 1))
+    if (g.alertEvent) li.run(id, '关联预警', `关联预警触发记录 #${g.alertEvent}`, '系统初始化', ago(g.bornAgo - 2))
+    li.run(id, '阶段变化', '影响阶段变化：萌芽 → 扩散（多平台出现转述，触达快速上升）', '系统', ago(g.bornAgo - 10))
+    if (g.stage === 'outbreak') li.run(id, '阶段变化', '影响阶段变化：扩散 → 爆发（关键媒体/KOL 集中转发，累计触达破 5 万）', '系统', ago(g.updatedAgo + 5))
+    li.run(id, '传播扩散', `累计沉淀节点 ${nodes.length} 个、转发关系 ${edges.length} 条，累计触达 ${g.reach.toLocaleString()}`, '系统', ago(g.updatedAgo))
+    return id
+  }
+
+  const reachOf = (nodes, edges) => nodes.reduce((a, nd) => a + nd[3], 0) + edges.reduce((a, e) => a + e[3], 0) * REPOST_REACH
+
+  // g1 食品安全 · 爆发期（关联红色危机 c1）
+  const foodNodes = [
+    ['@内幕探店君', 'origin', '论坛', 8000, 0, 0, pFood && pFood.id, '首爆暗访视频，附后厨操作录像', 185],
+    ['@热点围观', 'kol', '微博', 52000, 1, 1, null, '转发暗访片段并配文质疑', 170],
+    ['澎湃新闻', 'media', '新闻', 68000, 1, 1, null, '跟进报道并向品牌方求证', 150],
+    ['品牌官方微博', 'official', '微博', 30000, 2, 1, null, '发布致歉与关停涉事门店声明', 120],
+    ['@美食打假指南', 'kol', '抖音', 24000, 2, 1, null, '二创短视频扩散', 110],
+    ['本地头条', 'media', '新闻', 12000, 3, 0, null, '转述官方整改通报', 90],
+    ['围观网友A', 'user', '抖音', 3000, 2, 0, null, '情绪化跟拍投稿', 100],
+    ['跟帖消费者', 'user', '微博', 800, 2, 0, null, '评论区晒就餐经历（由大V转发带动）', 80]
+  ]
+  const foodEdges = [
+    [0, 1, 'quote', 3200, '原视频被截取转发'],
+    [0, 2, 'report', 1800, '媒体引用报料'],
+    [1, 4, 'repost', 5200, '大V带动短视频扩散'],
+    [2, 3, 'quote', 2600, '媒体提问后官方回应'],
+    [1, 7, 'repost', 300, ''],
+    [4, 5, 'report', 900, '地方媒体转述'],
+    [2, 4, 'quote', 1500, ''],
+    [1, 6, 'repost', 4500, '']
+  ]
+  buildGraph({
+    title: '某连锁品牌后厨卫生风波', topic: '食品安全', postId: pFood && pFood.id,
+    alertEvent: evFood && evFood.id, crisisId: c1 && c1.id, stage: 'outbreak', heat: 92,
+    reach: reachOf(foodNodes, foodEdges), origin: '论坛 @内幕探店君 首爆暗访视频（02:10）',
+    bornAgo: 190, updatedAgo: 80
+  }, foodNodes, foodEdges)
+
+  // g2 服务投诉 · 扩散期（关联橙色危机 c2）
+  const shipNodes = [
+    ['@等不到包裹的猫', 'origin', '微博', 2000, 0, 0, pShip && pShip.id, '晒多份订单截图吐槽', 95],
+    ['电商投诉台', 'kol', '微博', 8000, 1, 1, null, '汇总同类投诉并@品牌客服', 60],
+    ['新浪科技', 'media', '新闻', 12000, 1, 1, null, '报道预售发货延迟现象', 45],
+    ['跟帖买家', 'user', '微博', 500, 2, 0, null, '', 40],
+    ['知乎答主', 'user', '知乎', 4000, 2, 0, null, '长文分析预售规则', 35]
+  ]
+  const shipEdges = [
+    [0, 1, 'repost', 900, ''],
+    [0, 2, 'quote', 600, ''],
+    [1, 3, 'repost', 200, ''],
+    [2, 4, 'quote', 150, '']
+  ]
+  buildGraph({
+    title: '电商预售发货延迟吐槽链', topic: '服务投诉', postId: pShip && pShip.id,
+    alertEvent: evShip && evShip.id, crisisId: c2 && c2.id, stage: 'spread', heat: 76,
+    reach: reachOf(shipNodes, shipEdges), origin: '微博 @等不到包裹的猫 首条订单截图吐槽',
+    bornAgo: 95, updatedAgo: 30
+  }, shipNodes, shipEdges)
+
+  // g3 房地产延期 · 扩散期（暂无危机，仅关联黄色预警触发）
+  const estNodes = [
+    ['@业主代表陈先生', 'origin', '论坛', 1500, 0, 0, pEstate && pEstate.id, '业主聚集现场图文', 65],
+    ['@楼市观察家', 'kol', '微博', 9000, 1, 1, null, '转发维权进展', 50],
+    ['跟帖业主', 'user', '论坛', 600, 2, 0, null, '', 40]
+  ]
+  const estEdges = [
+    [0, 1, 'repost', 700, ''],
+    [1, 2, 'repost', 120, '']
+  ]
+  buildGraph({
+    title: '某地产项目延期交付维权传播', topic: '房地产', postId: pEstate && pEstate.id,
+    alertEvent: evEstate && evEstate.id, crisisId: null, stage: 'spread', heat: 68,
+    reach: reachOf(estNodes, estEdges), origin: '论坛 @业主代表陈先生 现场图文首报',
+    bornAgo: 70, updatedAgo: 40
+  }, estNodes, estEdges)
+}
+seedPropagation()

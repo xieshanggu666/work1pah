@@ -101,11 +101,11 @@ export function createWorkOrder(body, actor) {
   const assignee = String(b.assignee || '').trim()
   const assigneeRole = WO_ROLE[b.assignee_role] ? b.assignee_role : ''
   const r = run(`INSERT INTO work_orders
-    (crisis_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,sla_budget_ms,started_at,created,updated)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    (crisis_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,sla_budget_ms,started_at,created,updated,prop_graph_id)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     crisisId, title, String(b.detail || '').trim(), category, priority,
     assignee ? 'doing' : 'todo', assignee, assigneeRole, actor.user, dueAt, slaMin ? slaMin * 60000 : null,
-    assignee ? ts : null, ts, ts)
+    assignee ? ts : null, ts, ts, b.prop_graph_id ? +b.prop_graph_id : null)
   const id = Number(r.lastInsertRowid)
   addLog(id, 'created', `从危机「${c.title}」#${crisisId} 拆分工单（${WO_PRIORITY[priority]} · ${WO_CATEGORY[category]}）${slaMin ? ` · SLA ${slaMin} 分钟` : ' · 无时限'}`, actor)
   if (assignee) addLog(id, 'assigned', `分派给 ${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）`, actor)
