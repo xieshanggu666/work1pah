@@ -81,6 +81,7 @@
             </div>
             <div class="e-side">
               <span class="e-time">{{ e.time }}</span>
+              <button v-if="e.crisis_id" class="prop" @click="gotoProp(e)">🕸 传播路径</button>
               <button v-if="e.status!=='resolved'" class="resolve" @click="resolveOne(e)">解除</button>
             </div>
           </div>
@@ -129,6 +130,11 @@ function eLevel(alertId) {
   const a = alertList.value.find((x) => x.id === alertId)
   return a ? a.level : ''
 }
+// 跳转传播路径页并按该触发记录关联的危机过滤
+function gotoProp(e) {
+  store.propCrisisFilter = e.crisis_id
+  store.tab = 'prop'
+}
 function openCount(alertId) {
   return openCounts.value[alertId] || 0
 }
@@ -143,7 +149,7 @@ async function resolveAll(a) {
   await store.resolveAlert(a.id)
   load()
 }
-onMounted(async () => { await store.load; load() })
+onMounted(async () => { await load() })
 </script>
 
 <style scoped>
@@ -169,6 +175,7 @@ input,select,button{font-family:inherit;background:#0f1b38;border:1px solid rgba
 .open-tag{font-size:10px;color:#ffab91;background:#3e2723;border:1px solid rgba(255,138,101,.3);border-radius:5px;padding:1px 6px;margin-left:6px;}
 .hint{margin:0;font-size:10px;color:#5b6f94;line-height:1.5;}
 .resolve{background:none;border:1px solid rgba(102,187,106,.45);color:#81c784;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
+.prop{background:none;border:1px solid rgba(0,150,136,.45);color:#80cbc4;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
 .edit{background:none;border:1px solid rgba(144,202,249,.4);color:#90caf9;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
 .edit-form{margin-top:8px;background:#0f1b38;border:1px solid rgba(120,160,220,0.18);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;}
 .edit-form .hint{margin:0;font-size:10px;color:#5b6f94;line-height:1.5;}

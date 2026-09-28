@@ -11,6 +11,8 @@
       <div class="stat alarm"><span class="s-ic">🔔</span><b>{{ s.alertOpen ?? 0 }}</b><em>未解除预警</em></div>
       <div class="stat crisis"><span class="s-ic">🛟</span><b>{{ s.crisisActive ?? 0 }}</b><em>在办危机</em></div>
       <div class="stat wo"><span class="s-ic">📋</span><b>{{ s.workOpen ?? 0 }}</b><em>在办工单{{ s.workOverdue ? `（超时 ${s.workOverdue}）` : '' }}</em></div>
+      <div class="stat prop"><span class="s-ic">🕸</span><b>{{ s.propActive ?? 0 }}</b><em>监测传播路径</em></div>
+      <div class="stat prop-out"><span class="s-ic">🔥</span><b>{{ s.propOutbreak ?? 0 }}</b><em>爆发期路径</em></div>
     </div>
 
     <div class="grid">
@@ -88,12 +90,27 @@
           <span class="c-time">{{ c.updated }}</span>
         </div>
       </div>
+
+      <!-- 传播路径速览 -->
+      <div class="card wide">
+        <h4>🕸 舆情传播路径速览</h4>
+        <div class="prop-row" v-for="p in propPaths" :key="p.id">
+          <span class="p-stage" :class="p.stage">{{ stageText(p.stage) }}</span>
+          <span class="p-title">{{ p.title }}<i class="p-topic">#{{ p.topic||'未分类' }}</i></span>
+          <span class="p-stat">节点 {{ p.nodeCount }}</span>
+          <span class="p-stat">KOL {{ p.kolCount }}</span>
+          <span class="p-stat" :class="{hot:p.heat>=60}">🔥 {{ p.heat }}</span>
+          <span class="p-stat">层级 {{ p.maxDepth }}</span>
+          <span v-if="p.woCount" class="p-wo">📋 {{ p.woCount }}</span>
+        </div>
+        <div v-if="!propPaths.length" class="none">暂无传播路径（在「传播路径」页建档并记录转发关系）</div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { usePubStore } from '@/store/pub'
 const store = usePubStore()
 const s = computed(() => store.stats || {})
@@ -102,6 +119,14 @@ const sources = computed(() => store.sources)
 const trend = computed(() => store.trend)
 const activeAlerts = computed(() => store.activeAlerts)
 const crises = computed(() => store.crises)
+const propPaths = ref([])
+function stageText(x) { return { seed: '潜伏期', ferment: '发酵期', outbreak: '爆发期', decline: '回落期' }[x] || x }
+async function loadProp() {
+  try { propPaths.value = (await store.fetchProp()).items.slice(0, 6) } catch { /* 后端未就绪 */ }
+}
+let timer = null
+onMounted(() => { loadProp(); timer = setInterval(loadProp, 6000) })
+onUnmounted(() => clearInterval(timer))
 
 const cir = 2 * Math.PI * 48
 const segs = computed(() => {
@@ -136,6 +161,7 @@ function statusText(st) { return { monitoring: '监测中', disposal: '处置中
 .s-ic{font-size:20px;}
 .stat.pos b{color:#66bb6a;}.stat.neu b{color:#90a4ae;}.stat.neg b{color:#ef5350;}.stat.warn b{color:#ffb300;}.stat.red b{color:#ef5350;}
 .stat.alarm b{color:#ffab91;}.stat.crisis b{color:#90caf9;}.stat.wo b{color:#80cbc4;}
+.stat.prop b{color:#80cbc4;}.stat.prop-out b{color:#ef5350;}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;}
 @media(max-width:860px){.grid{grid-template-columns:1fr;}}
 .card{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;}
@@ -175,5 +201,15 @@ h4{margin:0 0 12px;color:#fff;font-size:14px;}
 .c-status{font-size:10px;padding:2px 8px;border-radius:6px;}
 .c-status.monitoring{background:#37474f;color:#b0bec5;}.c-status.disposal{background:#b71c1c;color:#ffcdd2;}.c-status.closed{background:#1b5e20;color:#a5d6a7;}
 .c-time{color:#5b6f94;font-size:11px;}
+.prop-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px dashed rgba(120,160,220,0.1);font-size:12px;}
+.prop-row:last-child{border-bottom:none;}
+.p-stage{font-size:10px;padding:2px 8px;border-radius:6px;flex:none;}
+.p-stage.seed{background:#37474f;color:#cfd8dc;}.p-stage.ferment{background:#33270e;color:#ffe082;}
+.p-stage.outbreak{background:#4a1518;color:#ef9a9a;}.p-stage.decline{background:#263238;color:#b0bec5;}
+.p-title{color:#dbe4f3;flex:1;min-width:140px;}
+.p-topic{font-style:normal;font-size:10px;color:#80cbc4;background:#0d2b28;border:1px solid rgba(0,150,136,.3);border-radius:5px;padding:1px 6px;margin-left:6px;}
+.p-stat{font-size:11px;color:#8ba2c8;}
+.p-stat.hot{color:#ef9a9a;font-weight:700;}
+.p-wo{font-size:10px;color:#81c784;background:#12261a;border-radius:5px;padding:1px 7px;}
 .none{color:#5b6f94;text-align:center;padding:20px;}
 </style>

@@ -20,6 +20,7 @@ export const usePubStore = defineStore('pub', {
     user: { name: '张岚', role: 'admin' }, // 当前身份（admin 管理员 / ops 值班员 / viewer 观察员）
     tab: 'dash',          // 当前页签（危机卡片可跳转协同工单）
     woDraftCrisis: null,  // 从危机卡片「拆分工单」带入的预填危机 id
+    propCrisisFilter: null, // 从危机卡片跳转传播路径页带入的危机过滤
     toast: null
   }),
   actions: {
@@ -149,6 +150,46 @@ export const usePubStore = defineStore('pub', {
     async workOrderOp(id, op, body) {
       const r = await api(`/work-orders/${id}/${op}`, 'POST', body || {})
       await this.load() // 工单回写危机时间线/预警状态：刷新全局统计
+      return r
+    },
+    // ===== 舆情传播路径分析 =====
+    async fetchProp(filter) { return await api('/prop', 'GET', null, filter) },
+    async fetchPropPath(id) { return (await api(`/prop/${id}`)).path },
+    async createProp(p) {
+      const r = await api('/prop', 'POST', p)
+      await this.load()
+      this.msg(`传播路径「${p.title || r.path.title}」已建档`, 'success')
+      return r
+    },
+    async updateProp(id, body) {
+      const r = await api(`/prop/${id}`, 'PUT', body)
+      await this.load()
+      return r
+    },
+    async deleteProp(id) {
+      const r = await api(`/prop/${id}`, 'DELETE')
+      await this.load()
+      this.msg(`传播路径「${r.title}」已删除（来源工单保留）`, 'info')
+      return r
+    },
+    async bindPropCrisis(id, crisis_id) { return await api(`/prop/${id}/crisis`, 'POST', { crisis_id }) },
+    async attachPropAlert(id, alert_id, is_origin) { return await api(`/prop/${id}/alerts`, 'POST', { alert_id, is_origin }) },
+    async detachPropAlert(id, alert_id) { return await api(`/prop/${id}/alerts/${alert_id}`, 'DELETE') },
+    // 记录转发关系（返回阶段推进/通知事件/自动工单，调用方提示）
+    async addPropEdge(id, edge) {
+      const r = await api(`/prop/${id}/edges`, 'POST', edge)
+      await this.load() // 角标（爆发路径数）刷新
+      return r
+    },
+    async declineProp(id, note) {
+      const r = await api(`/prop/${id}/decline`, 'POST', { note })
+      await this.load()
+      return r
+    },
+    async createPropWorkOrder(id, wo) {
+      const r = await api(`/prop/${id}/work-orders`, 'POST', wo)
+      await this.load()
+      this.msg(`已从传播路径拆分跨角色工单 #${r.id}`, 'success')
       return r
     }
   }

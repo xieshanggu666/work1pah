@@ -7,6 +7,10 @@ const q1 = (sql, ...p) => db.prepare(sql).get(...p)
 const run = (sql, ...p) => db.prepare(sql).run(...p)
 export const now = () => new Date().toLocaleString('zh-CN')
 
+// 传播路径联动钩子（index.js 注入 propagate.onAlertEvent；预警触发时挂接同话题/同规则路径）
+let propHooks = { onAlertEvent: null }
+export function bindPipelineProp(h) { propHooks = { ...propHooks, ...h } }
+
 // 高等级预警（红/橙）触发时自动建档危机事件
 export const AUTO_LEVELS = ['red', 'orange']
 export const LV_TEXT = { red: '红色', orange: '橙色', yellow: '黄色' }
@@ -146,6 +150,10 @@ export function checkAlerts(postId) {
       al.id, postId, crisisId, detail, ts, 'open', null)
     const eventId = Number(ev.lastInsertRowid)
     const notified = generateForAlertEvent(eventId).length // 通知编排：按订阅生成通知任务
+    // 传播路径联动：命中路径的关联预警规则/话题时自动挂接（失败不影响主链路）
+    if (propHooks.onAlertEvent) {
+      try { propHooks.onAlertEvent({ alertId: al.id, postId, crisisId, topic }) } catch (e) { console.error('[PROP] 预警挂接失败：', e.message) }
+    }
     fired.push({ alert: al.title, level: al.level, eventId, crisisId, deduped, topic, notified })
   }
   return fired

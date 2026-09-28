@@ -19,6 +19,7 @@
       <PostsView v-else-if="tab==='posts'" />
       <CollectView v-else-if="tab==='collect'" />
       <AlertCenterView v-else-if="tab==='alerts'" />
+      <PropagationView v-else-if="tab==='prop'" />
       <CrisisView v-else-if="tab==='crisis'" />
       <WorkOrderView v-else-if="tab==='work'" />
       <NotifyView v-else-if="tab==='notify'" />
@@ -37,6 +38,7 @@ import DashboardView from '@/components/DashboardView.vue'
 import PostsView from '@/components/PostsView.vue'
 import CollectView from '@/components/CollectView.vue'
 import AlertCenterView from '@/components/AlertCenterView.vue'
+import PropagationView from '@/components/PropagationView.vue'
 import CrisisView from '@/components/CrisisView.vue'
 import WorkOrderView from '@/components/WorkOrderView.vue'
 import NotifyView from '@/components/NotifyView.vue'
@@ -49,6 +51,7 @@ const tabs = [
   { key: 'posts', icon: '📰', label: '舆情列表' },
   { key: 'collect', icon: '🛰️', label: '数据源采集', badge: () => store.stats.collectRunning || 0 },
   { key: 'alerts', icon: '🚨', label: '预警中心' },
+  { key: 'prop', icon: '🕸', label: '传播路径', badge: () => store.stats.propOutbreak || 0 },
   { key: 'crisis', icon: '🛟', label: '危机处置' },
   { key: 'work', icon: '📋', label: '协同工单', badge: () => store.stats.workOpen || 0 },
   { key: 'notify', icon: '🔔', label: '通知中心', badge: () => store.stats.notifyOpen || 0 }

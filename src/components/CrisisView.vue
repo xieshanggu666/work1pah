@@ -30,6 +30,9 @@
           <span class="origin" :class="c.origin">{{ c.origin==='auto' ? '🤖 自动建档' : '✍️ 人工建档' }}</span>
           <span v-if="c.open_events" class="open-badge">🔔 未解除预警 {{ c.open_events }}</span>
           <span v-if="c.wo_total" class="wo-badge" :class="{open:c.wo_open}">📋 工单 {{ c.wo_open ? c.wo_open+' 在办 / ' : '' }}{{ c.wo_total }}</span>
+          <span v-if="c.prop_active" class="prop-badge" :class="{out:c.prop_outbreak}" @click="gotoProp(c)" title="查看关联的传播路径">
+            🕸 传播路径 {{ c.prop_active }}{{ c.prop_outbreak ? ' · 🔥爆发 '+c.prop_outbreak : '' }}
+          </span>
           <span class="st" :class="c.status">{{ stText(c.status) }}</span>
           <button class="del" @click="del(c)">✕</button>
         </div>
@@ -175,6 +178,11 @@ async function confirmClose(c) {
     review.value = null
   } catch (e) { store.msg(e.message, 'warn') } // 结案守卫：未完结工单拦截
 }
+// 跳转传播路径页并按该危机过滤
+function gotoProp(c) {
+  store.propCrisisFilter = c.id
+  store.tab = 'prop'
+}
 // 跳转协同工单页并预填所属危机（页签状态在 store）
 function splitWorkOrder(c) {
   store.woDraftCrisis = c.id
@@ -218,6 +226,8 @@ textarea{resize:vertical;min-height:52px;}
 .open-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.3);}
 .wo-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .wo-badge.open{background:#132a52;color:#bbdefb;border-color:rgba(66,165,245,.4);}
+.prop-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2b28;color:#80cbc4;border:1px solid rgba(0,150,136,.3);cursor:pointer;}
+.prop-badge.out{background:#3a1a24;color:#ef9a9a;border-color:rgba(239,83,80,.45);}
 .st{font-size:11px;padding:2px 10px;border-radius:6px;}
 .st.monitoring{background:#37474f;color:#b0bec5;}.st.disposal{background:#b71c1c;color:#ffcdd2;}.st.closed{background:#1b5e20;color:#a5d6a7;}
 .del{background:none;border:none;color:#ef5350;font-size:15px;cursor:pointer;}

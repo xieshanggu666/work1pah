@@ -44,8 +44,8 @@ function addLog(taskId, action, detail, operator = '系统') {
 }
 
 // ===== 任务生成（订阅匹配 → 多渠道并行任务；幂等键去重，重复触发不产生重复任务） =====
-// opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）
-function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', idemTag = '', title, content }) {
+// opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）/ prop（传播路径事件）
+function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', propPathId = null, idemTag = '', title, content }) {
   const created = []
   const ts = now()
   for (const chId of subChannels(sub)) {
@@ -53,12 +53,14 @@ function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKe
     if (!ch || !ch.enabled) continue // 停用/已删除渠道跳过
     const src = kind === 'alert' ? `alert:${alertEventId}`
       : kind === 'workorder' ? `wo:${woId}:${idemTag || woEvent}`
+      : kind === 'prop' ? `prop:${propPathId}:${idemTag}`
       : `crisis:${crisisId}:${statusKey}`
     const r = run(`INSERT OR IGNORE INTO notify_tasks
-      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,work_order_id,wo_event,created,updated)
-      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,NULL,?,?,?,?,?)`,
-      `${src}:sub${sub.id}:ch${chId}`, sub.id, chId, alertEventId, crisisId, kind === 'workorder' ? 'workorder' : kind, title, content,
-      Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0, woId, woEvent, ts, ts)
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,require_ack,work_order_id,wo_event,prop_path_id,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?)`,
+      `${src}:sub${sub.id}:ch${chId}`, sub.id, chId, alertEventId, crisisId,
+      kind === 'workorder' ? 'workorder' : kind, title, content,
+      Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0, woId, woEvent, propPathId, ts, ts)
     if (Number(r.changes)) {
       const id = Number(r.lastInsertRowid)
       addLog(id, 'created', `订阅「${sub.name}」匹配，生成通知任务（渠道：${ch.name}）`)
@@ -142,6 +144,38 @@ export function generateForWorkOrder(woId, woEvent, opts = {}) {
 // 工单超时升级通知：升级类任务写危机时间线（与回执超时升级一致），由工单调度器驱动
 export function notifyWorkOrderEscalation(woId, level) {
   return generateForWorkOrder(woId, level)
+}
+
+// ===== 传播路径事件 → 通知任务（prop_event：outbreak 爆发升级 / surge 热度激增 / kol KOL 加入） =====
+// 复用通知渠道、失败退避重试、回执与升级调度；幂等键按 路径×事件×订阅×渠道 去重。
+const PROP_EVENT_TEXT = { outbreak: '进入爆发期', surge: '热度激增', kol: 'KOL 加入转发' }
+export function generateForPropEvent(pathId, propEvent, extra = {}) {
+  const p = q1('SELECT * FROM prop_paths WHERE id=?', pathId)
+  if (!p || p.status !== 'active') return []
+  const all = []
+  const subs = q(`SELECT * FROM notify_subs WHERE active=1 AND prop_event=?`, propEvent)
+  if (!subs.length) return []
+  const titlePrefix = propEvent === 'outbreak' ? '【传播爆发升级】' : '【传播异动】'
+  const title = `${titlePrefix}${p.title}`
+  const bits = [`话题「${p.topic || '—'}」`, `事件：${PROP_EVENT_TEXT[propEvent] || propEvent}`]
+  if (extra.heat) bits.push(`当前热度 ${extra.heat}`)
+  if (extra.reach) bits.push(`本跳触达 ${extra.reach}`)
+  if (extra.node && extra.node.name) bits.push(`节点「${extra.node.name}」`)
+  const content = bits.join(' · ')
+  for (const s of subs) {
+    if (s.topic && s.topic !== p.topic) continue
+    all.push(...createTasks(s, { kind: 'prop', propPathId: pathId, crisisId: p.crisis_id, idemTag: propEvent, title, content }))
+  }
+  return all
+}
+
+// 启动时为存量爆发期路径补生成通知任务（幂等：重复启动不产生重复任务）
+export function seedPropNotifyTasks() {
+  let n = 0
+  for (const p of q("SELECT id FROM prop_paths WHERE status='active' AND stage='outbreak'")) {
+    n += generateForPropEvent(p.id, 'outbreak').length
+  }
+  return n
 }
 
 // ===== 模拟发送（演示）：渠道地址含 always-fail 持续失败、含 flaky 首次失败（验证自动重试） =====
@@ -362,7 +396,9 @@ export function validateSub(b) {
   if (cs && !CRISIS_STATUS_TEXT[cs]) return '危机状态无效'
   const we = String(b.wo_event || '')
   if (we && !['created', 'escalated'].includes(we)) return '工单事件无效（created/escalated）'
-  if (we && cs) return '工单事件订阅不能再选危机状态'
+  const pe = String(b.prop_event || '')
+  if (pe && !['outbreak', 'surge'].includes(pe)) return '传播事件无效（outbreak/surge）'
+  if ((we && cs) || (we && pe) || (cs && pe)) return '预警/危机/工单/传播事件订阅互斥，请只选一种匹配方式'
   const chs = Array.isArray(b.channel_ids) ? b.channel_ids.map(Number).filter(Number.isInteger) : []
   if (!chs.length) return '至少选择一个通知渠道'
   for (const id of chs) if (!q1('SELECT 1 FROM notify_channels WHERE id=?', id)) return `渠道 #${id} 不存在`

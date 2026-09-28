@@ -62,6 +62,7 @@
         <div v-if="w.detail" class="w-detail">{{ w.detail }}</div>
         <div class="w-meta">
           <span>危机 <i>#{{ w.crisis_id }} {{ w.crisis_title || '' }}</i></span>
+          <span v-if="w.prop_path_id" class="prop-src">🕸 源自传播路径 #{{ w.prop_path_id }}</span>
           <span>处理人 <i>{{ w.assignee ? `${w.assignee}${w.roleText ? '·'+w.roleText : ''}` : '待分派' }}</i></span>
           <span v-if="w.due_at && !['done','cancelled'].includes(w.status)" class="sla" :class="{over:w.overdue}">
             ⏱ {{ slaText(w) }}
@@ -264,6 +265,8 @@ textarea{resize:vertical;min-height:52px;}
 .w-detail{color:#8ba2c8;font-size:11px;margin:6px 0;}
 .w-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:10px;color:#5b6f94;}
 .w-meta i{color:#90caf9;font-style:normal;}
+.prop-src{color:#80cbc4;}
+.prop-src i{font-style:normal;}
 .sla{color:#8ba2c8;}
 .sla.over{color:#ef9a9a;font-weight:700;}
 .w-blocked{margin-top:6px;font-size:10px;color:#ce93d8;background:#241226;border-radius:6px;padding:4px 8px;}

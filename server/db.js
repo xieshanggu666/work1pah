@@ -285,6 +285,75 @@ CREATE TABLE IF NOT EXISTS work_order_logs (
   time TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_order_logs_wo ON work_order_logs (wo_id, id);
+-- ===== 舆情传播路径分析 =====
+-- 传播路径：沉淀一个话题的来源、节点、转发关系与影响阶段（seed/ferment/outbreak/decline）
+CREATE TABLE IF NOT EXISTS prop_paths (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,                  -- 路径标题（一般为话题名）
+  topic TEXT NOT NULL DEFAULT '',       -- 归并话题键（与 posts.topic / crisis.topic 同口径）
+  status TEXT NOT NULL DEFAULT 'active', -- active/archived（停用后不再随转发变化推进/通知）
+  stage TEXT NOT NULL DEFAULT 'seed',   -- seed 潜伏期 / ferment 发酵期 / outbreak 爆发期 / decline 回落期
+  origin_post_id INTEGER,               -- 首条来源舆情（posts.id，可空）
+  crisis_id INTEGER,                    -- 关联危机事件（可空，手动关联或按话题自动关联）
+  alert_id INTEGER,                     -- 来源预警规则（由预警触发建档时写入）
+  auto_wo INTEGER NOT NULL DEFAULT 1,   -- 进入爆发期且关联危机时是否自动生成跨角色处置工单
+  peak_heat INTEGER NOT NULL DEFAULT 0, -- 历史峰值热度（回落判定依据）
+  outbreak_at INTEGER,                  -- 本轮进入爆发期毫秒时间戳（每次爆发一轮）
+  last_outbreak_wo_at INTEGER,          -- 本轮爆发自动工单毫秒时间戳（每轮爆发至多一张自动工单）
+  first_at TEXT NOT NULL,
+  updated TEXT NOT NULL,
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_paths_topic ON prop_paths (topic);
+-- 传播节点：首发来源（root）、传播账号/媒体（node）、转发者；KOL 标记头部账号
+CREATE TABLE IF NOT EXISTS prop_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path_id INTEGER NOT NULL,
+  node_key TEXT NOT NULL,               -- 路径内唯一键（同名节点幂等）
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'node',    -- root 首发来源 / media 媒体 / kol 头部账号 / node 普通节点
+  channel TEXT NOT NULL DEFAULT '',     -- 所在渠道（微博/微信/新闻…）
+  followers INTEGER NOT NULL DEFAULT 0, -- 粉丝量（KOL/影响力判定参考）
+  first_seen TEXT NOT NULL,
+  UNIQUE (path_id, node_key)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_nodes_path ON prop_nodes (path_id, id);
+-- 转发/引用关系：from_node → to_node（to 转发/引用 from），沉淀传播边与触达
+CREATE TABLE IF NOT EXISTS prop_edges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path_id INTEGER NOT NULL,
+  from_node_id INTEGER,                 -- 被转发的上游节点（NULL=直接首发/原创）
+  to_node_id INTEGER NOT NULL,
+  post_id INTEGER,                      -- 对应舆情（posts.id，可空）
+  reposts INTEGER NOT NULL DEFAULT 0,   -- 该跳转发量
+  comments INTEGER NOT NULL DEFAULT 0,
+  likes INTEGER NOT NULL DEFAULT 0,
+  reach INTEGER NOT NULL DEFAULT 0,     -- 该跳触达人次
+  heat INTEGER NOT NULL DEFAULT 0,      -- 该跳上报热度（0=由互动量推算）
+  note TEXT NOT NULL DEFAULT '',
+  idem_key TEXT NOT NULL,               -- 转发关系幂等键（同分钟同边重复上报去重）
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_edges_path ON prop_edges (path_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prop_edges_idem ON prop_edges (idem_key);
+-- 路径 ↔ 预警规则（多对多）：一条路径可被多条规则命中，关联预警触发随路径留痕
+CREATE TABLE IF NOT EXISTS prop_path_alerts (
+  path_id INTEGER NOT NULL,
+  alert_id INTEGER NOT NULL,
+  is_origin INTEGER NOT NULL DEFAULT 0, -- 1=触发建档的来源规则
+  first_at TEXT NOT NULL,
+  PRIMARY KEY (path_id, alert_id)
+);
+-- 传播变化留痕：阶段推进/节点加入/转发记录/关联与工单动作全程可溯
+CREATE TABLE IF NOT EXISTS prop_change_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path_id INTEGER NOT NULL,
+  action TEXT NOT NULL,                 -- 建档/转发/阶段推进/关联预警/关联危机/回落/自动工单/编辑/删除
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prop_logs_path ON prop_change_logs (path_id, id);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
@@ -322,6 +391,14 @@ ensureColumn('notify_subs', 'wo_event', "wo_event TEXT NOT NULL DEFAULT ''")
 // 老库迁移：工单 SLA 挂起计时字段
 ensureColumn('work_orders', 'sla_budget_ms', 'sla_budget_ms INTEGER')
 ensureColumn('work_orders', 'paused_at', 'paused_at INTEGER')
+// 传播路径分析扩展：通知订阅/任务支持传播事件（prop_event：outbreak 爆发升级 / surge 热度激增 / kol KOL 加入）
+ensureColumn('notify_subs', 'prop_event', "prop_event TEXT NOT NULL DEFAULT ''")
+ensureColumn('notify_tasks', 'prop_path_id', 'prop_path_id INTEGER')
+// 工单来源标记：传播路径爆发自动/手动生成的跨角色工单（自动工单去重与回写路径留痕用）
+ensureColumn('work_orders', 'prop_path_id', 'prop_path_id INTEGER')
+// 老库迁移：传播路径表爆发时间戳列（早期 TEXT 定义以建表语句为准，这里仅补缺失列）
+ensureColumn('prop_paths', 'outbreak_at', 'outbreak_at INTEGER')
+ensureColumn('prop_paths', 'last_outbreak_wo_at', 'last_outbreak_wo_at INTEGER')
 
 // 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
 // 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。
@@ -533,6 +610,13 @@ function seedNotify() {
   // 标记工单事件订阅（wo_event：created=新工单分派/认领提醒，escalated=超时升级；普通预警订阅为空）
   db.prepare("UPDATE notify_subs SET wo_event='escalated' WHERE name='工单超时升级督办' AND wo_event=''").run()
   db.prepare("UPDATE notify_subs SET wo_event='created' WHERE name='协同工单分派通知' AND wo_event=''").run()
+  // 传播路径事件订阅（prop_event）：爆发升级（需回执）、热度激增/KOL 加入
+  const ps = db.prepare(`INSERT INTO notify_subs (name,alert_id,topic,crisis_status,levels,channel_ids,require_ack,ack_timeout_min,escalate_channel_id,max_retry,active,created,created_by,prop_event)
+    VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?)`)
+  // 传播进入爆发期 → 值班 Webhook + 危机邮箱组，需回执，1 分钟超时升级至升级专线
+  ps.run('传播爆发升级全员通知', null, '', '', '', JSON.stringify([ch1, ch2]), 1, 1, ch4, 3, nowStr, '系统初始化', 'outbreak')
+  // 传播热度激增 / KOL 加入 → 值班 Webhook
+  ps.run('传播异动（激增/KOL）提醒', null, '', '', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化', 'surge')
 }
 seedNotify()
 
@@ -595,3 +679,100 @@ function seedWorkOrders() {
     .run(c1.id, '工单完成', `协同工单「关停涉事门店现场核查」已由 李澈 完成：涉事门店已关停，现场核查完成，整改清单已下发并要求 24 小时内反馈。`, ago(118))
 }
 seedWorkOrders()
+
+// 传播路径分析种子（独立幂等：老库升级后同样补齐演示路径；来源/节点/转发关系/影响阶段完整沉淀）
+function seedProp() {
+  const n = db.prepare('SELECT COUNT(*) c FROM prop_paths').get().c
+  if (n > 0) return
+  const now = new Date()
+  const ago = (m) => new Date(now.getTime() - m * 60000).toLocaleString('zh-CN')
+  const agoMs = (m) => now.getTime() - m * 60000
+  const c1 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%门店卫生%' ORDER BY id LIMIT 1").get()
+  const c2 = db.prepare("SELECT id FROM crisis WHERE title LIKE '%投诉类话题%' ORDER BY id LIMIT 1").get()
+  const a1 = db.prepare("SELECT id FROM alerts WHERE title='负面情绪集中爆发'").get()
+  const a2 = db.prepare("SELECT id FROM alerts WHERE title='投诉类话题升温'").get()
+  const a3 = db.prepare("SELECT id FROM alerts WHERE title='选址关键词监控'").get()
+  if (!c1 || !c2 || !a1 || !a2 || !a3) return
+
+  const pi = db.prepare(`INSERT INTO prop_paths
+    (title,topic,status,stage,origin_post_id,crisis_id,alert_id,auto_wo,peak_heat,outbreak_at,last_outbreak_wo_at,first_at,updated,created)
+    VALUES (?,?, 'active',?, ?,?,?,?,?,?,?,?,?,?)`)
+  // P1 食安事件：已进入爆发期，关联红色危机 c1，爆发时自动生成过处置工单（已完成）
+  const p1 = Number(pi.run('某连锁品牌后厨卫生事件传播链', '食品安全', 'outbreak', 5, c1.id, a1.id, 1, 95,
+    agoMs(70), agoMs(40), ago(170), ago(40), ago(170)).lastInsertRowid)
+  // P2 服务投诉：发酵期，关联橙色危机 c2（再记录 KOL/高热度转发即跨入爆发期，触发通知与自动工单）
+  const p2 = Number(pi.run('电商预售不发货投诉扩散链', '服务投诉', 'ferment', 1, c2.id, a2.id, 1, 58,
+    null, null, ago(85), ago(20), ago(85)).lastInsertRowid)
+  // P3 地产维权：潜伏期，仅来源 + 单个节点，关联黄色预警（无危机）
+  const p3 = Number(pi.run('某楼盘延期交付维权舆情', '房地产', 'seed', 8, null, a3.id, 1, 38,
+    null, null, ago(60), ago(40), ago(60)).lastInsertRowid)
+
+  const ni = db.prepare('INSERT INTO prop_nodes (path_id,node_key,name,kind,channel,followers,first_seen) VALUES (?,?,?,?,?,?,?)')
+  const node = (pathId, key, name, kind, channel, followers, t) =>
+    Number(ni.run(pathId, key, name, kind, channel, followers, t).lastInsertRowid)
+  const ei = db.prepare(`INSERT INTO prop_edges
+    (path_id,from_node_id,to_node_id,post_id,reposts,comments,likes,reach,heat,note,idem_key,time)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const li = db.prepare('INSERT INTO prop_change_logs (path_id,action,detail,operator,time) VALUES (?,?,?,?,?)')
+  const ai = db.prepare('INSERT INTO prop_path_alerts (path_id,alert_id,is_origin,first_at) VALUES (?,?,1,?)')
+
+  // ---- P1 传播链：澎湃首发 → 美食打假王(KOL) → 微博热搜君(KOL)，媒体/问答节点跟进 ----
+  const root1 = node(p1, '澎湃新闻', '澎湃新闻', 'root', '新闻', 0, ago(170))
+  const kol1 = node(p1, '美食打假王', '美食打假王', 'kol', '微博', 8600000, ago(120))
+  const kol2 = node(p1, '微博热搜君', '微博热搜君', 'kol', '微博', 23000000, ago(70))
+  const med1 = node(p1, '抖音热点速报', '抖音热点速报', 'media', '抖音', 5100000, ago(60))
+  const nd1 = node(p1, '食安观察答主', '食安观察答主', 'node', '知乎', 180000, ago(45))
+  ei.run(p1, null, root1, 5, 320, 180, 900, 120000, 62, '暗访视频经媒体首发', `seed:p1:e1`, ago(170))
+  ei.run(p1, root1, kol1, null, 12000, 3400, 41000, 860000, 88, '头部美食博主转发点评', `seed:p1:e2`, ago(120))
+  ei.run(p1, kol1, kol2, null, 36000, 9800, 152000, 2300000, 95, '登微博热搜榜，话题主持人扩散', `seed:p1:e3`, ago(70))
+  ei.run(p1, kol1, med1, null, 8400, 2100, 33000, 510000, 82, '短视频媒体二次剪辑传播', `seed:p1:e4`, ago(60))
+  ei.run(p1, med1, nd1, null, 900, 520, 2600, 60000, 55, '问答平台专题讨论', `seed:p1:e5`, ago(45))
+  ai.run(p1, a1.id, ago(170))
+  ;[['建档', '传播路径建档：来源《澎湃新闻》暗访报道，话题「食品安全」', ago(170)],
+    ['阶段推进', '影响阶段：潜伏期 → 发酵期（节点 3 个，热度升至 88）', ago(120)],
+    ['阶段推进', '影响阶段：发酵期 → 爆发期（KOL「微博热搜君」加入，热度峰值 95）', ago(70)],
+    ['关联预警', '关联红色预警规则「负面情绪集中爆发」', ago(170)],
+    ['关联危机', '关联危机事件「某连锁品牌门店卫生事件」#1', ago(170)],
+    ['自动工单', '爆发期自动生成跨角色处置工单 #W1「传播溯源与口径统一」（公关）', ago(40)]]
+    .forEach(([act, det, t]) => li.run(p1, act, det, '系统', t))
+  // 爆发期自动工单（已完成，回写危机时间线）
+  const wid = Number(db.prepare(`INSERT INTO work_orders
+    (crisis_id,prop_path_id,title,detail,category,priority,status,assignee,assignee_role,created_by,started_at,done_at,result,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    c1.id, p1, '传播溯源与口径统一', '锁定暗访视频首发来源与关键转发节点，2 小时内统一对外口径并协调头部账号删改不实信息。',
+    'pr', 'urgent', 'done', '李澈', 'ops', '系统', ago(40), ago(35),
+    '已锁定首发来源与 2 个关键 KOL 节点，官方声明同步发布，协调平台对不实剪辑下架处理。', ago(40), ago(35)).lastInsertRowid)
+  const wl = db.prepare('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)')
+  wl.run(wid, 'created', '传播路径进入爆发期，系统自动拆分协同工单（紧急 · 公关口径）', '系统', 'admin', ago(40))
+  wl.run(wid, 'assigned', '分派给 李澈（值班员）', '系统', 'admin', ago(40))
+  wl.run(wid, 'done', '完成：已锁定首发来源与关键 KOL 节点，官方声明同步发布。', '李澈', 'ops', ago(35))
+  db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
+    .run(c1.id, '传播爆发', '传播路径「某连锁品牌后厨卫生事件传播链」进入爆发期：KOL「微博热搜君」转发，峰值热度 95，触达 230 万+。', ago(70))
+
+  // ---- P2 传播链：新浪科技首发 → 黑猫投诉 → 消费点评师(KOL，热度未及爆发阈值) ----
+  const root2 = node(p2, '新浪科技', '新浪科技', 'root', '微博', 0, ago(85))
+  const med2 = node(p2, '黑猫投诉平台', '黑猫投诉平台', 'media', '微博', 4200000, ago(50))
+  const kol3 = node(p2, '消费点评师', '消费点评师', 'kol', '微博', 3200000, ago(20))
+  ei.run(p2, null, root2, 1, 210, 96, 760, 80000, 45, '用户吐槽订单两周未发货', `seed:p2:e1`, ago(85))
+  ei.run(p2, root2, med2, null, 600, 410, 2200, 420000, 52, '投诉平台聚合受理，话题扩散', `seed:p2:e2`, ago(50))
+  ei.run(p2, med2, kol3, null, 900, 300, 3100, 320000, 58, '消费类 KOL 跟进点评（热度尚未到爆发阈值 60）', `seed:p2:e3`, ago(20))
+  ai.run(p2, a2.id, ago(85))
+  ;[['建档', '传播路径建档：来源《新浪科技》用户吐槽，话题「服务投诉」', ago(85)],
+    ['阶段推进', '影响阶段：潜伏期 → 发酵期（节点 3 个，热度升至 52）', ago(50)],
+    ['关联预警', '关联橙色预警规则「投诉类话题升温」', ago(85)],
+    ['关联危机', '关联危机事件「投诉类话题升温事件」#2', ago(85)]]
+    .forEach(([act, det, t]) => li.run(p2, act, det, '系统', t))
+  db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
+    .run(c2.id, '传播发酵', '传播路径「电商预售不发货投诉扩散链」进入发酵期：投诉平台聚合扩散，热度 52。', ago(50))
+
+  // ---- P3 传播链：凤凰网首发 → 业主论坛，潜伏期 ----
+  const root3 = node(p3, '凤凰网', '凤凰网', 'root', '微博', 0, ago(60))
+  const nd3 = node(p3, '业主在线论坛', '业主在线论坛', 'node', '论坛', 50000, ago(40))
+  ei.run(p3, null, root3, 8, 150, 88, 420, 60000, 38, '地产延期交付报道', `seed:p3:e1`, ago(60))
+  ei.run(p3, root3, nd3, null, 260, 120, 600, 50000, 30, '业主论坛聚集讨论', `seed:p3:e2`, ago(40))
+  ai.run(p3, a3.id, ago(60))
+  ;[['建档', '传播路径建档：来源《凤凰网》地产报道，话题「房地产」', ago(60)],
+    ['关联预警', '关联黄色预警规则「选址关键词监控」', ago(60)]]
+    .forEach(([act, det, t]) => li.run(p3, act, det, '系统', t))
+}
+seedProp()

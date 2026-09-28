@@ -24,7 +24,7 @@
           <div class="t-head">
             <span class="st" :class="t.status">{{ t.statusText }}</span>
             <b class="t-title">{{ t.title }}</b>
-            <span class="kind">{{ t.kind==='alert' ? '🚨 预警' : t.kind==='workorder' ? '📋 工单' : '🛟 危机' }}</span>
+            <span class="kind">{{ t.kind==='alert' ? '🚨 预警' : t.kind==='workorder' ? '📋 工单' : t.kind==='prop' ? '🕸 传播' : '🛟 危机' }}</span>
             <span v-if="t.escalated_from" class="esc-tag">⬆ 升级自 #{{ t.escalated_from }}</span>
           </div>
           <div class="t-content">{{ t.content }}</div>
@@ -35,6 +35,7 @@
             <span v-if="t.require_ack">回执 <i>{{ t.ack_by ? `${t.ack_by} · ${t.ack_at}` : '待确认' }}</i></span>
             <span v-if="t.crisis_id">危机 <i>#{{ t.crisis_id }}</i></span>
             <span v-if="t.work_order_id">工单 <i>#{{ t.work_order_id }}</i></span>
+            <span v-if="t.prop_path_id">传播路径 <i>#{{ t.prop_path_id }}</i></span>
             <span>更新 <i>{{ t.updated }}</i></span>
           </div>
           <div v-if="t.last_error" class="t-err">⚠ {{ t.last_error }}</div>
@@ -104,6 +105,7 @@
                 <option value="alert">🚨 预警触发</option>
                 <option value="crisis">🛟 危机状态流转</option>
                 <option value="wo">📋 协同工单事件</option>
+                <option value="prop">🕸 传播路径事件</option>
               </select>
               <select v-if="subForm.mode==='alert'" v-model="subForm.alert_id">
                 <option :value="null">全部规则</option>
@@ -114,9 +116,13 @@
                 <option value="disposal">处置中</option>
                 <option value="closed">已结案</option>
               </select>
-              <select v-else v-model="subForm.wo_event">
+              <select v-else-if="subForm.mode==='wo'" v-model="subForm.wo_event">
                 <option value="created">拆分/分派（含改派、认领提醒）</option>
                 <option value="escalated">超时升级（两级升级均触发）</option>
+              </select>
+              <select v-else v-model="subForm.prop_event">
+                <option value="outbreak">进入爆发期（爆发升级）</option>
+                <option value="surge">传播异动（热度激增 / KOL 加入）</option>
               </select>
             </div>
             <div class="row">
@@ -150,7 +156,7 @@
             <div v-for="s in subs" :key="s.id" class="sub" :class="{off:!s.active}">
               <div class="s-head">
                 <b>{{ s.name }}</b>
-                <span class="s-kind">{{ s.wo_event ? '📋 工单·'+(s.wo_event==='escalated'?'超时升级':'拆分分派') : s.crisis_status ? '🛟 危机·'+crisisStatus[s.crisis_status] : '🚨 预警' }}</span>
+                <span class="s-kind">{{ s.prop_event ? '🕸 传播·'+(s.prop_event==='outbreak'?'爆发升级':'异动/激增/KOL') : s.wo_event ? '📋 工单·'+(s.wo_event==='escalated'?'超时升级':'拆分分派') : s.crisis_status ? '🛟 危机·'+crisisStatus[s.crisis_status] : '🚨 预警' }}</span>
               </div>
               <small>{{ subDesc(s) }}</small>
               <div class="s-chs">
@@ -218,7 +224,7 @@ const taskLogs = ref([])
 const levels = [{ k: 'red', t: '红' }, { k: 'orange', t: '橙' }, { k: 'yellow', t: '黄' }]
 const chForm = ref({ name: '', type: 'webhook', target: '' })
 const subForm = ref({
-  name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', topic: '',
+  name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', prop_event: 'outbreak', topic: '',
   levels: [], channel_ids: [], require_ack: false, ack_timeout_min: 30, escalate_channel_id: null, max_retry: 3
 })
 
@@ -236,6 +242,7 @@ function logActionText(a) {
   }[a] || a
 }
 function subDesc(s) {
+  if (s.prop_event) return `传播路径${s.prop_event === 'outbreak' ? '进入爆发期（爆发升级）' : '热度激增 / KOL 加入'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.wo_event) return `协同工单${s.wo_event === 'escalated' ? '超时升级（两级）' : '拆分/分派'}时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   if (s.crisis_status) return `危机进入「${crisisStatus.value[s.crisis_status] || s.crisis_status}」时通知${s.topic ? ` · 话题「${s.topic}」` : ''}`
   const parts = []
@@ -304,6 +311,7 @@ async function addSub() {
     topic: f.mode === 'wo' ? '' : f.topic,
     crisis_status: f.mode === 'crisis' ? f.crisis_status : '',
     wo_event: f.mode === 'wo' ? f.wo_event : '',
+    prop_event: f.mode === 'prop' ? f.prop_event : '',
     levels: f.mode === 'alert' ? f.levels : [],
     channel_ids: f.channel_ids,
     require_ack: f.require_ack,
@@ -311,7 +319,7 @@ async function addSub() {
     escalate_channel_id: f.escalate_channel_id,
     max_retry: f.max_retry
   }))
-  subForm.value = { name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', topic: '', levels: [], channel_ids: [], require_ack: false, ack_timeout_min: 30, escalate_channel_id: null, max_retry: 3 }
+  subForm.value = { name: '', mode: 'alert', alert_id: null, crisis_status: 'closed', wo_event: 'created', prop_event: 'outbreak', topic: '', levels: [], channel_ids: [], require_ack: false, ack_timeout_min: 30, escalate_channel_id: null, max_retry: 3 }
 }
 async function delSub(s) {
   if (!confirm(`删除订阅「${s.name}」？已生成的任务不受影响。`)) return

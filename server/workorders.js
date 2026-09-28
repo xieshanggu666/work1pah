@@ -100,10 +100,12 @@ export function createWorkOrder(body, actor) {
   const dueAt = slaMin ? nowMs + slaMin * 60000 : null
   const assignee = String(b.assignee || '').trim()
   const assigneeRole = WO_ROLE[b.assignee_role] ? b.assignee_role : ''
+  const propPathId = +b.prop_path_id || null
+  const fromProp = propPathId && q1('SELECT 1 FROM prop_paths WHERE id=?', propPathId) ? propPathId : null
   const r = run(`INSERT INTO work_orders
-    (crisis_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,sla_budget_ms,started_at,created,updated)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    crisisId, title, String(b.detail || '').trim(), category, priority,
+    (crisis_id,prop_path_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,sla_budget_ms,started_at,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    crisisId, fromProp, title, String(b.detail || '').trim(), category, priority,
     assignee ? 'doing' : 'todo', assignee, assigneeRole, actor.user, dueAt, slaMin ? slaMin * 60000 : null,
     assignee ? ts : null, ts, ts)
   const id = Number(r.lastInsertRowid)
